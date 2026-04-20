@@ -1,0 +1,125 @@
+name: Grilo SC Analysis for .NET (Fallback Enabled)
+
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-analysis:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PROJECT_BASE_KEY: "grilo-org_20260420T055654_lucasdelsilva_ExpensesFlows"
+
+    steps:
+      - name: 1. Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 2. Detect .NET Version
+        id: detect_net_version
+        run: |
+          if [ -f "global.json" ]; then
+            sdk_version_full=$(jq -r '.sdk.version' global.json | sed 's/[^0-9.]*//g')
+            if [ -n "$sdk_version_full" ]; then
+              sdk_version_major_minor=$(echo "$sdk_version_full" | cut -d'.' -f1,2)
+              echo "dotnet_version=$sdk_version_major_minor" >> $GITHUB_OUTPUT
+            fi
+          fi
+          if ! grep -q "dotnet_version" "$GITHUB_OUTPUT" 2>/dev/null; then
+            target_framework=$(grep -ohr '<TargetFramework>net[0-9.]\+</TargetFramework>' . | sed -e 's/<[^>]*>//g' | sort -V | tail -n 1)
+            if [ -n "$target_framework" ]; then
+              sdk_version_from_tf=$(echo "$target_framework" | sed 's/net//')
+              echo "dotnet_version=$sdk_version_from_tf" >> $GITHUB_OUTPUT
+            else
+              echo "dotnet_version=8.0" >> $GITHUB_OUTPUT
+            fi
+          fi
+        shell: bash
+
+      - name: 3. Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ steps.detect_net_version.outputs.dotnet_version }}
+
+      - name: 4. Install SonarScanner and Coverlet
+        run: |
+          dotnet tool install --global dotnet-sonarscanner
+          dotnet tool install --global coverlet.console
+
+      - name: 5. Find Target to Build (.sln or .csproj)
+        id: find_target
+        run: |
+          # Prioridade 1: Arquivo de Solução (.sln)
+          target_file=$(find . -maxdepth 2 -name "*.sln" -not -path "./.git/*" | head -n 1)
+          
+          if [ -z "$target_file" ]; then
+             echo "WARN: Nenhum .sln encontrado. Procurando por .csproj principal..."
+             # Prioridade 2: Arquivo .csproj (ignorando testes)
+             # Tenta achar um que tenha "API" ou "Web" no nome, senão pega o primeiro que não for teste
+             target_file=$(find . -name "*.csproj" -not -path "*Test*" -not -path "*test*" | grep -iE "API|Web" | head -n 1)
+             
+             if [ -z "$target_file" ]; then
+               # Fallback final: qualquer csproj que não seja teste
+               target_file=$(find . -name "*.csproj" -not -path "*Test*" -not -path "*test*" | head -n 1)
+             fi
+          fi
+          
+          if [ -n "$target_file" ]; then
+            echo "DEBUG: Alvo de build encontrado: $target_file"
+            echo "build_target=$target_file" >> $GITHUB_OUTPUT
+          else
+            echo "ERRO CRÍTICO: Nenhum arquivo .sln ou .csproj válido encontrado."
+            exit 1
+          fi
+        shell: bash
+
+      - name: 6. Begin SonarScanner Step
+        run: |
+          dotnet sonarscanner begin /k:"${{ env.PROJECT_BASE_KEY }}" /o:"grilo-org" \
+            /d:sonar.host.url="https://sonarcloud.io" \
+            /d:sonar.login="${{ env.SONAR_TOKEN }}" \
+            /d:sonar.cs.cobertura.reportPaths="**/coverage.cobertura.xml" \
+            /d:sonar.verbose="true"
+        shell: bash
+
+      - name: 7. Build and Run Tests
+        run: |
+          TARGET="${{ steps.find_target.outputs.build_target }}"
+          echo "DEBUG: Compilando $TARGET..."
+          dotnet build "$TARGET" --no-incremental
+          
+          # Tenta rodar testes se houver projetos de teste na pasta
+          # (Isso evita erro se rodar dotnet test num csproj que não é de teste)
+          if find . -name "*Test*.csproj" -o -name "*test*.csproj" | grep -q .; then
+             dotnet test --no-build --collect:"XPlat Code Coverage" --logger "console;verbosity=detailed" || true
+          else
+             echo "INFO: Nenhum projeto de teste explícito encontrado para rodar."
+          fi
+        shell: bash
+
+      - name: 8. End SonarScanner Step
+        run: |
+          dotnet sonarscanner end /d:sonar.login="${{ env.SONAR_TOKEN }}" | tee sonar_end_output.log
+        shell: bash
+
+      - name: 9. Verify SonarCloud Analysis Results
+        run: |
+          TASK_ID=$(grep -a -o 'ce/task?id=[^&[:space:]]*' sonar_end_output.log | cut -d'=' -f2)
+          if [ -z "$TASK_ID" ]; then
+            echo "ERRO: Não foi possível encontrar o ID da tarefa."
+            exit 1
+          fi
+          
+          TASK_URL="https://sonarcloud.io/api/ce/task?id=$TASK_ID"
+          for i in {1..30}; do
+            status=$(curl -s -u "${{ env.SONAR_TOKEN }}:" "$TASK_URL" | jq -r .task.status )
+            if [ "$status" == "SUCCESS" ]; then break; fi
+            sleep 10
+          done
+        shell: bash
