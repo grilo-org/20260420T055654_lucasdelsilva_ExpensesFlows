@@ -1,0 +1,7 @@
+﻿using ExpensesFlows.Communication.Requests;
+
+namespace ExpensesFlows.Application.UseCases.Expenses.Update;
+public interface IUpdateExpenseUseCase
+{
+    Task Execute(long id, RequestExpenseJson request);
+}
